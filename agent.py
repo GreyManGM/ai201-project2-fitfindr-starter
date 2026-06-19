@@ -94,7 +94,80 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     """
     # TODO: implement the planning loop
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse the query with regex
+    # Strategy: look for explicit size tokens (XS/S/M/L/XL/XXL or number sizes),
+    # price ceilings ("under $30", "$30", "30 dollars"), and treat the rest as
+    # the description. Regex is chosen over LLM here — it's deterministic, free,
+    # and the patterns are well-defined enough that an LLM adds no value.
+    import re
+
+    size_pattern = r"(?:size\s+)?(XXS|XS|S\b|M\b|L\b|XL|XXL|[0-9]+[WTP])\b"
+    price_pattern = r"(?:under|below|max|less than)?\s*\$?(\d+(?:\.\d+)?)\s*(?:dollars?)?"
+
+    size_match = re.search(size_pattern, query, re.IGNORECASE)
+    price_match = re.search(price_pattern, query, re.IGNORECASE)
+
+    size = size_match.group(1).upper() if size_match else None
+    max_price = float(price_match.group(1)) if price_match else None
+
+    # Description: strip out the size/price tokens to get the clothing keywords
+    description = query
+    if size_match:
+        description = description.replace(size_match.group(0), "")
+    if price_match:
+        description = description.replace(price_match.group(0), "")
+    # Clean up filler words that don't help keyword matching
+    for filler in ["under", "below", "max", "less than", "looking for",
+                   "i want", "find me", "size", "dollars", "$"]:
+        description = re.sub(filler, "", description, flags=re.IGNORECASE)
+    description = " ".join(description.split())  # collapse whitespace
+
+    session["parsed"] = {
+        "description": description,
+        "size": size,
+        "max_price": max_price,
+    }
+
+    # Step 3: Search listings — branch on empty results
+    results = search_listings(
+        description=session["parsed"]["description"],
+        size=session["parsed"]["size"],
+        max_price=session["parsed"]["max_price"],
+    )
+    session["search_results"] = results
+
+    if not results:
+        filters = []
+        if size:
+            filters.append(f"size {size}")
+        if max_price is not None:
+            filters.append(f"under ${max_price:.0f}")
+        filter_str = " and ".join(filters)
+        hint = f" Try different keywords, a higher budget, or removing the size filter." if filters else " Try different keywords."
+        session["error"] = (
+            f"No listings found for '{description}'"
+            + (f" ({filter_str})" if filter_str else "")
+            + hint
+        )
+        return session  # ← early exit: suggest_outfit never called
+
+    # Step 4: Select the top result (highest relevance score from search_listings)
+    session["selected_item"] = results[0]
+
+    # Step 5: Suggest outfit using selected item and wardrobe
+    session["outfit_suggestion"] = suggest_outfit(
+        new_item=session["selected_item"],
+        wardrobe=session["wardrobe"],
+    )
+
+    # Step 6: Create fit card from outfit suggestion and selected item
+    session["fit_card"] = create_fit_card(
+        outfit=session["outfit_suggestion"],
+        new_item=session["selected_item"],
+    )
+
+    # Step 7: Return completed session
     return session
 
 
@@ -121,3 +194,4 @@ if __name__ == "__main__":
         wardrobe=get_example_wardrobe(),
     )
     print(f"Error message: {session2['error']}")
+ 
